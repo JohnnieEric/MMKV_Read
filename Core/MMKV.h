@@ -296,6 +296,10 @@ public:
             || (m_mode & MMKV_ASHMEM) != 0; // ashmem is always multi-process
     }
 #endif
+    /**
+     * MMKV_SINGLE_PROCESS MMKV_MULTI_PROCESS 都等于0 返回false
+     * @return 
+     */
     bool isReadOnly() const { return (m_mode & MMKV_READ_ONLY) != 0; }
 
 #ifndef MMKV_DISABLE_CRYPT

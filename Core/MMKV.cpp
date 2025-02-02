@@ -162,8 +162,9 @@ void initialize() {
     g_instanceDic = new unordered_map<string, MMKV *>;
     g_instanceLock = new ThreadLock();
     g_instanceLock->initialize();
-
+    //获得pageSize
     mmkv::DEFAULT_MMAP_SIZE = mmkv::getPageSize();
+    //日志
     MMKVInfo("version %s, page size %d, arch %s", MMKV_VERSION, DEFAULT_MMAP_SIZE, MMKV_ABI);
 
     // get CPU status of ARMv8 extensions (CRC32, AES)
@@ -201,7 +202,9 @@ static ThreadOnceToken_t once_control = ThreadOnceUninitialized;
 void MMKV::initializeMMKV(const MMKVPath_t &rootDir, MMKVLogLevel logLevel, mmkv::LogHandler handler) {
     g_currentLogLevel = logLevel;
     g_logHandler = handler;
-
+    //ThreadLock::ThreadOnce 方法通常用于线程安全的单次初始化，
+    // 类似于 pthread_once 或 std::call_once。它确保某个初始化逻辑 
+    // 在多线程环境下只执行一次，避免竞态条件和重复初始化的问题。
     ThreadLock::ThreadOnce(&once_control, initialize);
 
 #ifdef MMKV_APPLE
@@ -458,6 +461,8 @@ bool MMKV::set(bool value, MMKVKey_t key, uint32_t expireDuration) {
     if (isKeyEmpty(key)) {
         return false;
     }
+    //size = 5 : 1，因为是布尔值
+    //mmkv_unlikely为CPU优化，此处大概率为false
     size_t size = mmkv_unlikely(m_enableKeyExpire) ? Fixed32Size + pbBoolSize() : pbBoolSize();
     MMBuffer data(size);
     CodedOutputData output(data.getPtr(), size);
@@ -480,9 +485,13 @@ bool MMKV::set(int32_t value, MMKVKey_t key, uint32_t expireDuration) {
     if (isKeyEmpty(key)) {
         return false;
     }
+    //计算size
     size_t size = mmkv_unlikely(m_enableKeyExpire) ? Fixed32Size + pbInt32Size(value) : pbInt32Size(value);
+    //创建一个缓存区
     MMBuffer data(size);
+    //绑定缓冲区
     CodedOutputData output(data.getPtr(), size);
+    //写入缓存区
     output.writeInt32(value);
     if (mmkv_unlikely(m_enableKeyExpire)) {
         auto time = (expireDuration != ExpireNever) ? getCurrentTimeInSecond() + expireDuration : ExpireNever;
@@ -490,7 +499,7 @@ bool MMKV::set(int32_t value, MMKVKey_t key, uint32_t expireDuration) {
     } else {
         assert(expireDuration == ExpireNever && "setting expire duration without calling enableAutoKeyExpire() first");
     }
-
+    // C++11 方法 std::move(data)作用将data数据传给setDataForKey方法，并将data置空，避免了数据拷贝
     return setDataForKey(std::move(data), key);
 }
 
@@ -605,7 +614,7 @@ bool MMKV::set(double value, MMKVKey_t key, uint32_t expireDuration) {
 }
 
 #ifndef MMKV_APPLE
-
+//android走这里
 bool MMKV::setDataForKey(mmkv::MMBuffer &&data, MMKV::MMKVKey_t key, uint32_t expireDuration) {
     if (mmkv_likely(!m_enableKeyExpire)) {
         assert(expireDuration == ExpireNever && "setting expire duration without calling enableAutoKeyExpire() first");

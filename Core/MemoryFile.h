@@ -33,6 +33,10 @@ namespace mmkv {
 extern int g_android_api;
 extern std::string g_android_tmpDir;
 
+/**
+ * 文件的类型：普通文件和共享内存机制文件（android）
+ * https://blog.csdn.net/jdsjlzx/article/details/138499392
+ */
 enum FileType : bool { MMFILE_TYPE_FILE = false, MMFILE_TYPE_ASHMEM = true };
 } // namespace mmkv
 #endif // MMKV_ANDROID

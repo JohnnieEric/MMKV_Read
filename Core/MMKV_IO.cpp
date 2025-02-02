@@ -78,15 +78,18 @@ void MMKV::loadFromFile() {
     } else {
         // error checking
         bool loadFromFile = false, needFullWriteback = false;
+        //校验数据，如果数据损坏或者版本降级/升级的情况下，尝试自动恢复数据并修复文件
         checkDataValid(loadFromFile, needFullWriteback);
         MMKVInfo("loading [%s] with %zu actual size, file size %zu, InterProcess %d, meta info "
                  "version:%u",
                  m_mmapID.c_str(), m_actualSize, m_file->getFileSize(), isMultiProcess(), m_metaInfo->m_version);
+        //获取mmap映射到内存的地址
         auto ptr = (uint8_t *) m_file->getMemory();
         // loading
         if (loadFromFile && m_actualSize > 0) {
             MMKVInfo("loading [%s] with crc %u sequence %u version %u", m_mmapID.c_str(), m_metaInfo->m_crcDigest,
                      m_metaInfo->m_sequence, m_metaInfo->m_version);
+            //ptr + Fixed32Size跳过前4个字节
             MMBuffer inputBuffer(ptr + Fixed32Size, m_actualSize, MMBufferNoCopy);
             if (m_crypter) {
                 clearDictionary(m_dicCrypt);
@@ -100,6 +103,7 @@ void MMKV::loadFromFile() {
                 } else
 #endif
                 {
+                    //数据存入m_dic，修复损坏数据，如果存入失败，能更新多少是多少
                     MiniPBCoder::greedyDecodeMap(*m_dic, inputBuffer);
                 }
             } else {
@@ -109,21 +113,28 @@ void MMKV::loadFromFile() {
                 } else
 #endif
                 {
+                    //Key-Value数据存入m_dic
                     MiniPBCoder::decodeMap(*m_dic, inputBuffer);
                 }
             }
+            //创建输出流
             m_output = new CodedOutputData(ptr + Fixed32Size, m_file->getFileSize() - Fixed32Size);
+            //追加新数据
             m_output->seek(m_actualSize);
+            //前面校验文件需要对文件重写
             if (needFullWriteback) {
                 fullWriteback();
             }
         } else {
+            //如果文件损坏或者空的，或者之前的CRC校验失败，将文件清空
             // file not valid or empty, discard everything
             SCOPED_LOCK(m_exclusiveProcessLock);
 
             m_output = new CodedOutputData(ptr + Fixed32Size, m_file->getFileSize() - Fixed32Size);
+            //更新头部信息
             if (m_actualSize > 0) {
                 writeActualSize(0, 0, nullptr, IncreaseSequence);
+                //同步到磁盘
                 sync(MMKV_SYNC);
             } else {
                 writeActualSize(0, 0, nullptr, KeepSequence);
@@ -224,20 +235,37 @@ void MMKV::loadMetaInfoAndCheck() {
     }
 }
 
+/**
+ * 校验文件完整性和有效性
+ * 数据损坏或者版本降级/升级的情况下，尝试自动恢复数据并修复文件
+ * @param loadFromFile 
+ * @param needFullWriteback 
+ *      场景	                 loadFromFile	needFullWriteback	处理方式
+ * 文件 CRC 校验通过	            true	         false	直接加载数据
+ * 降级数据恢复成功	            true	         false	重新加载恢复的数据
+ * 数据损坏但可恢复（CRC 失败）	    true	         true	重新加载数据并进行 Full Writeback
+ * 文件大小错误但可恢复	        true	         true	调整 m_actualSize 并 Full Writeback
+ * 数据彻底损坏，无法恢复	        false	         false	数据加载失败
+ */
 void MMKV::checkDataValid(bool &loadFromFile, bool &needFullWriteback) {
     // try auto recover from last confirmed location
     auto fileSize = m_file->getFileSize();
     auto checkLastConfirmedInfo = [&] {
+        //如果版本大于3
         if (m_metaInfo->m_version >= MMKVVersionActualSize) {
             // downgrade & upgrade support
             uint32_t oldStyleActualSize = 0;
+            //将m_file读取4字节拷贝到&oldStyleActualSize
             memcpy(&oldStyleActualSize, m_file->getMemory(), Fixed32Size);
+            //如果m_file数据大小不等于实际大小
             if (oldStyleActualSize != m_actualSize) {
                 MMKVWarning("oldStyleActualSize %u not equal to meta actual size %lu", oldStyleActualSize,
                             m_actualSize);
                 if (oldStyleActualSize < fileSize && (oldStyleActualSize + Fixed32Size) <= fileSize) {
+                    //校验m_file CRC
                     if (checkFileCRCValid(oldStyleActualSize, m_metaInfo->m_crcDigest)) {
                         MMKVInfo("looks like [%s] been downgrade & upgrade again", m_mmapID.c_str());
+                        //数据可能降级，需要升级，重新加载File更新实际大小
                         loadFromFile = true;
                         writeActualSize(oldStyleActualSize, m_metaInfo->m_crcDigest, nullptr, KeepSequence);
                         return;
@@ -299,7 +327,11 @@ void MMKV::checkDataValid(bool &loadFromFile, bool &needFullWriteback) {
     }
 }
 
+/**
+ * 确保数据的读入
+ */
 void MMKV::checkLoadData() {
+    //检查如果没有load过数据load一次，调用 loadFromFile 确保所有的文件数据被读进 m_dic 中，这里直接取就可以了
     if (m_needLoadFromFile) {
         SCOPED_LOCK(m_sharedProcessLock);
 
@@ -405,7 +437,7 @@ bool MMKV::ensureMemorySize(size_t newSize) {
         MMKVWarning("[%s] file readonly", m_mmapID.c_str());
         return false;
     }
-
+    //新增key、value长度大于文件剩余的长度 或者 mmkv没有任何key-value记录，表示需要扩展文件并重写
     if (newSize >= m_output->spaceLeft() || (m_crypter ? m_dicCrypt->empty() : m_dic->empty())) {
         // remove expired keys
         if (m_enableKeyExpire) {
@@ -414,6 +446,7 @@ bool MMKV::ensureMemorySize(size_t newSize) {
         // try a full rewrite to make space
         auto preparedData = m_crypter ? prepareEncode(*m_dicCrypt) : prepareEncode(*m_dic);
         // dic.empty() means inserting key-value for the first time, no need to call msync()
+        //如果字典不为空，那么需要调用 msync() 保证数据同步到磁盘，如果为空不需要
         return expandAndWriteBack(newSize, std::move(preparedData), m_crypter ? !m_dicCrypt->empty() : !m_dic->empty());
     }
     return true;
@@ -421,19 +454,29 @@ bool MMKV::ensureMemorySize(size_t newSize) {
 
 // try a full rewrite to make space
 bool MMKV::expandAndWriteBack(size_t newSize, std::pair<mmkv::MMBuffer, size_t> preparedData, bool needSync) {
+    //计算文件的大小
     auto fileSize = m_file->getFileSize();
+    //计算字典数据大小
     auto sizeOfDic = preparedData.second;
+    //增加数据后需要的空间大小
     size_t lenNeeded = sizeOfDic + Fixed32Size + newSize;
+    //当前字典数据量
     size_t nowDicCount = m_crypter ? m_dicCrypt->size() : m_dic->size();
+    //新增后字典数据量
     size_t laterDicCount = std::max<size_t>(1, nowDicCount + 1);
     // or use <cmath> ceil()
+    //计算平均每一个key-value需要的空间大小
     size_t avgItemSize = (lenNeeded + laterDicCount - 1) / laterDicCount;
+    //计算未来大概需要的空间大小，取8个或者目前数据量一半的最大值
     size_t futureUsage = avgItemSize * std::max<size_t>(8, laterDicCount / 2);
     // 1. no space for a full rewrite, double it
     // 2. or space is not large enough for future usage, double it to avoid frequently full rewrite
+    //如果需要的大小大于文件大小 or 在需要同步文件的情况下未来预估总量(需要的大小+未来预估)大于文件大小 进行扩容，
+    // 直到文件大小满足未来预估总量
     if (lenNeeded >= fileSize || (needSync && (lenNeeded + futureUsage) >= fileSize)) {
         size_t oldSize = fileSize;
         do {
+            //每次扩充两倍
             fileSize *= 2;
         } while (lenNeeded + futureUsage >= fileSize);
         MMKVInfo("extending [%s] file size from %zu to %zu, incoming size:%zu, future usage:%zu", m_mmapID.c_str(),
@@ -579,13 +622,24 @@ thread_local AESCryptStatus t_status;
 #    endif
 #endif // MMKV_DISABLE_CRYPT
 
+/**
+ * 
+ * @param data 
+ * @param key 
+ * @param isDataHolder 默认false
+ * @return 
+ */
 bool MMKV::setDataForKey(MMBuffer &&data, MMKVKey_t key, bool isDataHolder) {
     if ((!isDataHolder && data.length() == 0) || isKeyEmpty(key)) {
         return false;
     }
+    //会创建一个 ScopedLock 对象，确保你在作用域内安全地使用锁，并且在离开作用域时自动释放锁。
+    //ScopedLock 使用 RAII（资源获取即初始化）模式，保证了锁的自动管理，避免了忘记释放锁的问题。
     SCOPED_LOCK(m_lock);
     SCOPED_LOCK(m_exclusiveProcessLock);
+    //非常重要的数据校验，
     checkLoadData();
+//启用加密才编译进来
 
 #ifndef MMKV_DISABLE_CRYPT
     if (m_crypter) {
@@ -607,6 +661,7 @@ bool MMKV::setDataForKey(MMBuffer &&data, MMKVKey_t key, bool isDataHolder) {
                 ret = appendDataWithKey(data, key, itr->second, isDataHolder);
             }
 #    else
+            //启用加密android执行这里
             KVHolderRet_t ret;
             if (onlyOneKey) {
                 ret = overrideDataWithKey(data, key, isDataHolder);
@@ -661,13 +716,23 @@ bool MMKV::setDataForKey(MMBuffer &&data, MMKVKey_t key, bool isDataHolder) {
     } else
 #endif // MMKV_DISABLE_CRYPT
     {
+        //如果没有启用加密走这里
+        //查找key是否存在
         auto itr = m_dic->find(key);
+        //在 C++ 里，std::unordered_map<K, V>::find(key) 方法会返回一个迭代器 itr：
+        //如果 key 存在，则 itr 指向该 key 对应的元素。
+        //如果 key 不存在，则 itr 等于 m_dic->end()（表示查找失败）
+        //以下为当key存在的时候
         if (itr != m_dic->end()) {
             // compare data before appending to file
+            //对比检查数据是否变化，此功能需要开启，默认不开启
             if (isCompareBeforeSetEnabled()) {
                 auto basePtr = (uint8_t *) (m_file->getMemory()) + Fixed32Size;
+                //取出value 转换为MMBuffer
                 MMBuffer oldValueData = itr->second.toMMBuffer(basePtr);
+                //默认isDataHolder是false，不清楚什么时候使用
                 if (isDataHolder) {
+                    //isDataHolder需要读出新旧值进行对比
                     CodedInputData inputData(oldValueData.getPtr(), oldValueData.length());
                     try {
                         // read extra holder header bytes and to real MMBuffer
@@ -682,36 +747,44 @@ bool MMKV::setDataForKey(MMBuffer &&data, MMKVKey_t key, bool isDataHolder) {
                         MMKVWarning("compareBeforeSet fail");
                     }
                 } else {
+                    //如果新旧value相等，就不用更新了
                     if (oldValueData == data) {
                         //  MMKVInfo("[key] %s, set the same data", key.c_str());
                         return true;
                     }
                 }
             }
-
-            bool onlyOneKey = !isMultiProcess() && m_dic->size() == 1;
+            //如果新旧值不相等
+            //CPU优化，大概率执行m_enableKeyExpire = false，不启用key过期策略
             if (mmkv_likely(!m_enableKeyExpire)) {
                 KVHolderRet_t ret;
+                //onlyOneKey是加密时候赋值，此时一定为false，判断当前是否只有一个 key 且不支持多进程，这种情况下可以直接覆盖数据
                 if (onlyOneKey) {
                     ret = overrideDataWithKey(data, itr->second, isDataHolder);
                 } else {
+                    //追加key
                     ret = appendDataWithKey(data, itr->second, isDataHolder);
                 }
+                //如果没有写入成功，返回false
                 if (!ret.first) {
                     return false;
                 }
+                //更新 itr->second value
                 itr->second = std::move(ret.second);
             } else {
+                //如果执行了key过期策略
                 KVHolderRet_t ret;
                 if (onlyOneKey) {
                     ret = overrideDataWithKey(data, key, isDataHolder);
                 } else {
                     ret = appendDataWithKey(data, key, isDataHolder);
                 }
+                //如果遇到key过期的清空，会更新失败
                 if (!ret.first) {
                     return false;
                 }
                 itr = m_dic->find(key);
+                //如果找到了key更新，找不到重新插入
                 if (itr != m_dic->end()) {
                     itr->second = std::move(ret.second);
                 } else {
@@ -721,6 +794,9 @@ bool MMKV::setDataForKey(MMBuffer &&data, MMKVKey_t key, bool isDataHolder) {
                 }
             }
         } else {
+            //如果key不存在
+            //判断是否可以直接重写文件，只有一个key，m_dic为空
+            //以下操作和上文略同
             bool needOverride = !isMultiProcess() && m_dic->empty() && m_actualSize > 0;
             KVHolderRet_t ret;
             if (needOverride) {
@@ -821,19 +897,21 @@ bool MMKV::removeDataForKey(MMKVKey_t key) {
 
 KVHolderRet_t
 MMKV::doAppendDataWithKey(const MMBuffer &data, const MMBuffer &keyData, bool isDataHolder, uint32_t originKeyLength) {
+    //判断key是否经过编译，如果 keyData.length() 大于 originKeyLength，说明 key 经过了额外编码，Ps：keyData.length() 不可能大于 originKeyLength
     auto isKeyEncoded = (originKeyLength < keyData.length());
     auto keyLength = static_cast<uint32_t>(keyData.length());
     auto valueLength = static_cast<uint32_t>(data.length());
     if (isDataHolder) {
         valueLength += pbRawVarint32Size(valueLength);
     }
+    //计算存储key、value需要的时间
     // size needed to encode the key
     size_t size = isKeyEncoded ? keyLength : (keyLength + pbRawVarint32Size(keyLength));
     // size needed to encode the value
     size += valueLength + pbRawVarint32Size(valueLength);
 
     SCOPED_LOCK(m_exclusiveProcessLock);
-
+    //判断存储空间是否足够，如果空间不足ensureMemorySize后续方法会进行扩容
     bool hasEnoughSize = ensureMemorySize(size);
     if (!hasEnoughSize || !isFileValid()) {
         return make_pair(false, KeyValueHolder());
@@ -852,7 +930,9 @@ MMKV::doAppendDataWithKey(const MMBuffer &data, const MMBuffer &keyData, bool is
         }
     }
 #endif
+    //存储空间足够
     try {
+        //写入key
         if (isKeyEncoded) {
             m_output->writeRawData(keyData);
         } else {
@@ -861,6 +941,7 @@ MMKV::doAppendDataWithKey(const MMBuffer &data, const MMBuffer &keyData, bool is
         if (isDataHolder) {
             m_output->writeRawVarint32((int32_t) valueLength);
         }
+        //写入value
         m_output->writeData(data); // note: write size of data
     } catch (std::exception &e) {
         MMKVError("%s", e.what());
@@ -877,9 +958,11 @@ MMKV::doAppendDataWithKey(const MMBuffer &data, const MMBuffer &keyData, bool is
         m_crypter->encrypt(ptr, ptr, size);
     }
 #endif
+    //更新文件大小
     m_actualSize += size;
+    //更新CRC校验信息
     updateCRCDigest(ptr, size);
-
+    //返回true和 未编码前的要添加的 key 的长度，要添加的value长度和追加数据前的文件大小
     return make_pair(true, KeyValueHolder(originKeyLength, valueLength, offset));
 }
 
@@ -897,7 +980,7 @@ KVHolderRet_t MMKV::doOverrideDataWithKey(const MMBuffer &data,
     size_t size = isKeyEncoded ? keyLength : (keyLength + pbRawVarint32Size(keyLength));
     // size needed to encode the value
     size += valueLength + pbRawVarint32Size(valueLength);
-
+    //空间不足还是执行追加以便可以扩容
     if (!checkSizeForOverride(size)) {
         return doAppendDataWithKey(data, keyData, isDataHolder, originKeyLength);
     }
@@ -964,15 +1047,22 @@ KVHolderRet_t MMKV::doOverrideDataWithKey(const MMBuffer &data,
     return make_pair(true, KeyValueHolder(originKeyLength, valueLength, offset));
 }
 
+/**
+ *  检查 MMKV 文件是否有足够的空间来覆盖（override）新数据，而不需要调整文件大小（ftruncate()
+ * @param size 
+ * @return 
+ */
 bool MMKV::checkSizeForOverride(size_t size) {
     if (!isFileValid()) {
         MMKVWarning("[%s] file not valid", m_mmapID.c_str());
         return false;
     }
-
+    
     // only override if the file can hole it without ftruncate()
     auto fileSize = m_file->getFileSize();
+    //计算覆盖新数据所需的总空间
     auto spaceNeededForOverride = size + Fixed32Size + ItemSizeHolderSize;
+    //检查是否有足够空间
     if (size > fileSize || spaceNeededForOverride > fileSize) {
         return false;
     }
@@ -984,6 +1074,7 @@ KVHolderRet_t MMKV::appendDataWithKey(const MMBuffer &data, MMKVKey_t key, bool 
     auto oData = [key dataUsingEncoding:NSUTF8StringEncoding];
     auto keyData = MMBuffer(oData, MMBufferNoCopy);
 #else
+    //创建一个 MMBuffer 对象 keyData，它指向文件中key的存储位置，key.size() 是该键的实际字节长度
     auto keyData = MMBuffer((void *) key.data(), key.size(), MMBufferNoCopy);
 #endif
     return doAppendDataWithKey(data, keyData, isDataHolder, static_cast<uint32_t>(keyData.length()));
@@ -994,6 +1085,7 @@ KVHolderRet_t MMKV::overrideDataWithKey(const MMBuffer &data, MMKVKey_t key, boo
     auto oData = [key dataUsingEncoding:NSUTF8StringEncoding];
     auto keyData = MMBuffer(oData, MMBufferNoCopy);
 #else
+    //创建一个 MMBuffer 对象 keyData，它指向文件中key的存储位置，key.size() 是该键的实际字节长度
     auto keyData = MMBuffer((void *) key.data(), key.size(), MMBufferNoCopy);
 #endif
     return doOverrideDataWithKey(data, keyData, isDataHolder, static_cast<uint32_t>(keyData.length()));
@@ -1001,24 +1093,28 @@ KVHolderRet_t MMKV::overrideDataWithKey(const MMBuffer &data, MMKVKey_t key, boo
 
 KVHolderRet_t MMKV::appendDataWithKey(const MMBuffer &data, const KeyValueHolder &kvHolder, bool isDataHolder) {
     SCOPED_LOCK(m_exclusiveProcessLock);
-
+    //计算key的长度
     uint32_t keyLength = kvHolder.keySize;
     // size needed to encode the key
     size_t rawKeySize = keyLength + pbRawVarint32Size(keyLength);
 
     // ensureMemorySize() might change kvHolder.offset, so have to do it early
-    {
+    {   
+        //传入的数据长度
         auto valueLength = static_cast<uint32_t>(data.length());
         if (isDataHolder) {
             valueLength += pbRawVarint32Size(valueLength);
         }
+        //计算key和value的空间
         auto size = rawKeySize + valueLength + pbRawVarint32Size(valueLength);
         bool hasEnoughSize = ensureMemorySize(size);
         if (!hasEnoughSize) {
             return make_pair(false, KeyValueHolder());
         }
     }
+    //获取key的内存位置
     auto basePtr = (uint8_t *) m_file->getMemory() + Fixed32Size;
+    //创建一个 MMBuffer 对象 keyData，它指向文件中key的存储位置，rawKeySize 是该键的实际字节长度
     MMBuffer keyData(basePtr + kvHolder.offset, rawKeySize, MMBufferNoCopy);
 
     return doAppendDataWithKey(data, keyData, isDataHolder, keyLength);
@@ -1259,6 +1355,7 @@ static void fullWriteBackWholeData(MMBuffer allData, size_t totalSize, CodedOutp
 
 #ifndef MMKV_DISABLE_CRYPT
 bool MMKV::doFullWriteBack(pair<MMBuffer, size_t> prepared, AESCrypt *newCrypter, bool needSync) {
+    //获取文件地址及文件大小
     auto ptr = (uint8_t *) m_file->getMemory();
     auto totalSize = prepared.second;
 #    ifdef MMKV_IOS
@@ -1267,21 +1364,23 @@ bool MMKV::doFullWriteBack(pair<MMBuffer, size_t> prepared, AESCrypt *newCrypter
         return false;
     }
 #    endif
-
+    //初始化加密器
     uint8_t newIV[AES_KEY_LEN];
     auto encrypter = (newCrypter == InvalidCryptPtr) ? nullptr : (newCrypter ? newCrypter : m_crypter);
     if (encrypter) {
         AESCrypt::fillRandomIV(newIV);
         encrypter->resetIV(newIV, sizeof(newIV));
     }
-
+    //释放之前的输出对象，创建新的输出对象
     delete m_output;
     m_output = new CodedOutputData(ptr + Fixed32Size, m_file->getFileSize() - Fixed32Size);
     if (m_crypter) {
+        //有加密进行加密
         auto decrypter = m_crypter;
         memmoveDictionary(*m_dicCrypt, m_output, ptr, decrypter, encrypter, prepared);
     } else if (prepared.first.length() != 0) {
         auto &preparedData = prepared.first;
+        //将数据写到文件
         fullWriteBackWholeData(std::move(preparedData), totalSize, m_output);
         if (encrypter) {
             encrypter->encrypt(ptr + Fixed32Size, ptr + Fixed32Size, totalSize);
@@ -1289,8 +1388,9 @@ bool MMKV::doFullWriteBack(pair<MMBuffer, size_t> prepared, AESCrypt *newCrypter
     } else {
         memmoveDictionary(*m_dic, m_output, ptr, encrypter, totalSize);
     }
-
+    //更新写入的数据实际大小
     m_actualSize = totalSize;
+    //重新计算 CRC 校验，再将期和写入数据大小等信息写入头文件
     if (encrypter) {
         recalculateCRCDigestWithIV(newIV);
     } else {
@@ -1298,6 +1398,7 @@ bool MMKV::doFullWriteBack(pair<MMBuffer, size_t> prepared, AESCrypt *newCrypter
     }
     m_hasFullWriteback = true;
     // make sure lastConfirmedMetaInfo is saved if needed
+    //需要同步，同步保证写入磁盘
     if (needSync) {
         sync(MMKV_SYNC);
     }

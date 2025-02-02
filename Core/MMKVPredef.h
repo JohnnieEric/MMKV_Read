@@ -246,12 +246,17 @@ constexpr size_t AES_KEY_BITSET_LEN = 128;
 
 #endif //cplus-plus
 
-#ifndef MMKV_WIN32
-#    ifndef likely
+//如果是非Windows平台，即android/linux平台
+#ifndef MMKV_WIN32 
+//如果没有被定义过
+#    ifndef likely 
+//CPU优化，当方法为mmkv_likely(x) 提示编译器：x 大概率为 true，让 CPU 预取 if(x) 之后的代码，提高分支预测命中率。
+//当方法为mmkv_unlikely(x) 提示编译器：x 大概率为 false，优化 if(x) 为不常执行的情况，减少 CPU 误预测的损耗。
 #        define mmkv_unlikely(x) (__builtin_expect(bool(x), 0))
 #        define mmkv_likely(x) (__builtin_expect(bool(x), 1))
 #    endif
 #else
+//如果是Windows平台直接返回x，MSVC（微软编译器）不支持 __builtin_expect()，所以只能直接返回 x，不做优化
 #    ifndef likely
 #        define mmkv_unlikely(x) (x)
 #        define mmkv_likely(x) (x)

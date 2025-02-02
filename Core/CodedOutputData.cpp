@@ -32,11 +32,23 @@
 using namespace std;
 
 namespace mmkv {
+//用于处理将数据编码写入输出缓冲区的操作。
+// CodedOutputData 提供了一些方法，
+// 允许你将各种类型的数据（如整数、浮点数、字节等）以特定格式写入一个内存缓冲区
 
+/**
+* 构造函数，初始化输出缓冲区指针 m_ptr 和缓冲区大小 m_size，并设置初始写入位置 m_position。
+* @param ptr 
+* @param len 
+*/
 CodedOutputData::CodedOutputData(void *ptr, size_t len) : m_ptr((uint8_t *) ptr), m_size(len), m_position(0) {
     MMKV_ASSERT(m_ptr);
 }
 
+    /**
+     * 返回当前的写入指针，即指向下一个将要写入位置的指针。
+     * @return 
+     */
 uint8_t *CodedOutputData::curWritePointer() {
     return m_ptr + m_position;
 }
@@ -69,6 +81,11 @@ void CodedOutputData::writeUInt32(uint32_t value) {
     writeRawVarint32(static_cast<int32_t>(value));
 }
 
+/**
+ * writeBool 函数将布尔值 true 或 false 转换为相应的字节（1 或 0），
+ * 并通过 writeRawByte 函数将其写入输出缓冲区。这样做的好处是，布尔值被编码为单字节，可以方便地传输或存储。
+ * @param value 
+ */
 void CodedOutputData::writeBool(bool value) {
     this->writeRawByte(static_cast<uint8_t>(value ? 1 : 0));
 }
@@ -94,6 +111,10 @@ void CodedOutputData::writeString(const string &value) {
 
 #endif // MMKV_APPLE
 
+    /**
+     * 返回剩余可写入的空间大小（即 m_size - m_position），帮助判断是否有足够的空间来写入数据。
+     * @return 
+     */
 size_t CodedOutputData::spaceLeft() {
     if (m_size <= m_position) {
         return 0;
@@ -101,6 +122,10 @@ size_t CodedOutputData::spaceLeft() {
     return m_size - m_position;
 }
 
+    /**
+     * 将当前写入位置向前移动 addedSize 字节，允许跳过或定位到新的写入位置。
+     * @param addedSize 
+     */
 void CodedOutputData::seek(size_t addedSize) {
     m_position += addedSize;
 
@@ -109,10 +134,17 @@ void CodedOutputData::seek(size_t addedSize) {
     }
 }
 
+    /**
+     * 重置写入位置，将 m_position 设置为 0，表示可以从缓冲区的开始重新写入数据。
+     */
 void CodedOutputData::reset() {
     m_position = 0;
 }
 
+    /**
+     * 返回当前写入位置 m_position。
+     * @return 
+     */
 size_t CodedOutputData::getPosition() {
     return m_position;
 }

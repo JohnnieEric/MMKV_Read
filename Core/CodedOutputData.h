@@ -30,8 +30,17 @@
 namespace mmkv {
 
 class CodedOutputData {
+    /**
+     * 常量指针，指向数据缓冲区（类型为 uint8_t *，即字节数组）。这个缓冲区用于存储被写入的数据。
+     */
     uint8_t *const m_ptr;
+    /**
+     * 缓冲区的总大小，表示 m_ptr 指向的内存空间的大小。
+     */
     size_t m_size;
+    /**
+     * 当前写入位置。它表示下一个将要写入数据的位置。
+     */
     size_t m_position;
 
 public:

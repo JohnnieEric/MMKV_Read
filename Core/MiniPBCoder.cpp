@@ -503,21 +503,32 @@ bool MiniPBCoder::decodeOneVector(std::vector<double> &result) {
 
 #endif // MMKV_HAS_CPP20
 
+/*
+ * 分为贪婪模式和普通模式
+
+ */
 void MiniPBCoder::decodeOneMap(MMKVMap &dic, size_t position, bool greedy) {
     auto block = [position, this](MMKVMap &dictionary) {
+        //如果position>0，则从指定位置读取
         if (position) {
             m_inputData->seek(position);
         } else {
+            //否则，跳过数据前 4 字节
             m_inputData->readInt32();
         }
+        //读取数据直到结尾
         while (!m_inputData->isAtEnd()) {
             KeyValueHolder kvHolder;
+            //读取key
             const auto &key = m_inputData->readString(kvHolder);
             if (key.length() > 0) {
+                //读取value
                 m_inputData->readData(kvHolder);
                 if (kvHolder.valueSize > 0) {
+                    //将value存入dictionary
                     dictionary[key] = std::move(kvHolder);
                 } else {
+                    //key不存在，从dictionary移除
                     auto itr = dictionary.find(key);
                     if (itr != dictionary.end()) {
                         dictionary.erase(itr);
@@ -529,6 +540,7 @@ void MiniPBCoder::decodeOneMap(MMKVMap &dic, size_t position, bool greedy) {
 
     if (greedy) {
         try {
+            //贪婪模式直接传入dic，能解析多少是多少
             block(dic);
         } catch (std::exception &exception) {
             MMKVError("%s", exception.what());
@@ -537,6 +549,7 @@ void MiniPBCoder::decodeOneMap(MMKVMap &dic, size_t position, bool greedy) {
         }
     } else {
         try {
+            //正常模式临时存储到tmpDic中，完成后再转移到dic内
             MMKVMap tmpDic;
             block(tmpDic);
             dic.swap(tmpDic);

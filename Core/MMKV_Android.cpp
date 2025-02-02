@@ -39,6 +39,15 @@ using namespace mmkv;
 extern unordered_map<string, MMKV *> *g_instanceDic;
 extern ThreadLock *g_instanceLock;
 
+/**
+ * MMKV_android构造方法
+ * @param mmapID 
+ * @param size 
+ * @param mode 
+ * @param cryptKey 
+ * @param rootPath 
+ * @param expectedCapacity 
+ */
 MMKV::MMKV(const string &mmapID, int size, MMKVMode mode, const string *cryptKey, const string *rootPath, size_t expectedCapacity)
     : m_mmapID(mmapID)
     , m_mode(mode)
@@ -47,6 +56,8 @@ MMKV::MMKV(const string &mmapID, int size, MMKVMode mode, const string *cryptKey
     , m_dic(nullptr)
     , m_dicCrypt(nullptr)
     , m_expectedCapacity(std::max<size_t>(DEFAULT_MMAP_SIZE, roundUp<size_t>(expectedCapacity, DEFAULT_MMAP_SIZE)))
+    //(mode & MMKV_ASHMEM) ? MMFILE_TYPE_ASHMEM : MMFILE_TYPE_FILE 这里mode如果填的是MMKV_SINGLE_PROCESS或者是MMKV_MULTI_PROCESS，
+    //最后fileType都是MMFILE_TYPE_FILE  这是为什么？ASHMEN机制呢？？？？
     , m_file(new MemoryFile(m_path, size, (mode & MMKV_ASHMEM) ? MMFILE_TYPE_ASHMEM : MMFILE_TYPE_FILE, m_expectedCapacity, isReadOnly()))
     , m_metaFile(new MemoryFile(m_crcPath, DEFAULT_MMAP_SIZE, m_file->m_fileType, 0, isReadOnly()))
     , m_metaInfo(new MMKVMetaInfo())
@@ -121,7 +132,7 @@ MMKV::MMKV(const string &mmapID, int ashmemFD, int ashmemMetaFD, const string *c
     {
         m_dic = new MMKVMap();
     }
-
+    //初始化的时候设定需要loadFormFile，在第一次添加数值或者时候loadFormFile，保证仅仅loadFormFile一次
     m_needLoadFromFile = true;
     m_hasFullWriteback = false;
 
@@ -137,18 +148,32 @@ MMKV::MMKV(const string &mmapID, int ashmemFD, int ashmemMetaFD, const string *c
     }*/
 }
 
+/**
+ * 
+ * @param mmapID  "mmkv.default"
+ * @param size PageSize
+ * @param mode  进程
+ * @param cryptKey  加密密钥
+ * @param rootPath  
+ * @param expectedCapacity 
+ * @return 
+ */
 MMKV *MMKV::mmkvWithID(const string &mmapID, int size, MMKVMode mode, const string *cryptKey, const string *rootPath, size_t expectedCapacity) {
     if (mmapID.empty() || !g_instanceLock) {
         return nullptr;
     }
+    //加锁
     SCOPED_LOCK(g_instanceLock);
-
+    //根据mmapId和rootPath构成mmapKey
     auto mmapKey = mmapedKVKey(mmapID, rootPath);
+    //在map中查找相关的mmkv
     auto itr = g_instanceDic->find(mmapKey);
+    //找到了直接返回
     if (itr != g_instanceDic->end()) {
         MMKV *kv = itr->second;
         return kv;
     }
+    //如果没有找到就构建MMKV并放入g_instanceDic内
     if (rootPath) {
         if (!isFileExist(*rootPath)) {
             if (!mkPath(*rootPath)) {
@@ -160,6 +185,7 @@ MMKV *MMKV::mmkvWithID(const string &mmapID, int size, MMKVMode mode, const stri
 
     string realID;
     auto correctPath = mappedKVPathWithID(mmapID, mode, rootPath);
+    //生成地址
     if ((mode & MMKV_BACKUP) || (rootPath && isFileExist(correctPath))) {
         // it's successfully migrated to the correct path by newer version of MMKV
         realID = mmapID;
@@ -167,8 +193,10 @@ MMKV *MMKV::mmkvWithID(const string &mmapID, int size, MMKVMode mode, const stri
         // historically Android mistakenly use mmapKey as mmapID
         realID = mmapKey;
     }
+    //构造函数
     auto kv = new MMKV(realID, size, mode, cryptKey, rootPath, expectedCapacity);
     kv->m_mmapKey = mmapKey;
+    //放入Map g_instanceDic内
     (*g_instanceDic)[mmapKey] = kv;
     return kv;
 }
@@ -219,6 +247,11 @@ void MMKV::checkReSetCryptKey(int fd, int metaFD, const string *cryptKey) {
 }
 #    endif // MMKV_DISABLE_CRYPT
 
+/**
+ * 检查进程
+ * 
+ * @return 
+ */
 bool MMKV::checkProcessMode() {
     // avoid exception on open() error
     if (!m_file->isFileValid()) {
@@ -227,20 +260,31 @@ bool MMKV::checkProcessMode() {
 
     if (isMultiProcess()) {
         if (!m_exclusiveProcessModeLock) {
+            //InterProcessLock 是一个用于 跨进程锁 的类，
+            // 通常用于确保多个进程之间对共享资源的访问是互斥的。
+            // 在多进程环境下，如果多个进程访问同一个资源或文件，
+            // 可能会导致数据竞态（race conditions），从而引发不可预测的行为。
+            // 为了避免这种情况，我们需要使用锁机制来控制进程间的同步和互斥。
             m_exclusiveProcessModeLock = new InterProcessLock(m_fileModeLock, ExclusiveLockType);
         }
         // avoid multiple processes get shared lock at the same time, https://github.com/Tencent/MMKV/issues/523
         auto tryAgain = false;
+        //获取exclusive进程锁
         auto exclusiveLocked = m_exclusiveProcessModeLock->try_lock(&tryAgain);
+        //获取成功返回
         if (exclusiveLocked) {
             return true;
         }
+        //此时tryAgain的值是什么？？？
+        //如果exclusive进程锁获取失败，获取shared进程锁
         auto shareLocked = m_sharedProcessModeLock->try_lock();
         if (!shareLocked) {
             // this call will fail on most case, just do it to make sure
             m_exclusiveProcessModeLock->try_lock();
             return true;
         } else {
+            //获取shared进程锁成功，再次尝试获取exclusive进程锁
+            //此时tryAgain的值是什么？？？
             if (!tryAgain) {
                 // something wrong with the OS/filesystem, let's try again
                 exclusiveLocked = m_exclusiveProcessModeLock->try_lock(&tryAgain);

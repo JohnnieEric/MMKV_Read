@@ -124,6 +124,11 @@ size_t File::getActualFileSize() const {
     return size;
 }
 
+/**
+ * 扩展文件
+ * @param size 
+ * @return 
+ */
 bool MemoryFile::truncate(size_t size) {
     if (!m_diskFile.isFileValid()) {
         return false;
@@ -152,17 +157,19 @@ bool MemoryFile::truncate(size_t size) {
     if (m_size < DEFAULT_MMAP_SIZE || (m_size % DEFAULT_MMAP_SIZE != 0)) {
         m_size = ((m_size / DEFAULT_MMAP_SIZE) + 1) * DEFAULT_MMAP_SIZE;
     }
-
+    //::ftruncate方法扩展或者截断文件，扩展文件是在末尾补0，方法返回0，等于成功，方法返回-1，等于失败
     if (::ftruncate(m_diskFile.m_fd, static_cast<off_t>(m_size)) != 0) {
         MMKVError("fail to truncate [%s] to size %zu, %s", m_diskFile.m_path.c_str(), m_size, strerror(errno));
         m_size = oldSize;
         return false;
     }
+    //扩展文件成功
     if (m_size > oldSize) {
+        //往扩展的文件部分写0
         if (!zeroFillFile(m_diskFile.m_fd, oldSize, m_size - oldSize)) {
             MMKVError("fail to zeroFile [%s] to size %zu, %s", m_diskFile.m_path.c_str(), m_size, strerror(errno));
             m_size = oldSize;
-
+            //失败了就把文件恢复原貌
             // redo ftruncate to its previous size
             int status = ::ftruncate(m_diskFile.m_fd, static_cast<off_t>(m_size));
             if (status != 0) {
@@ -177,6 +184,10 @@ bool MemoryFile::truncate(size_t size) {
     }
 
     if (m_ptr) {
+        //释放 mmap 创建的内存映射，解除进程地址空间和文件的映射关系。
+        //addr：要解除映射的起始地址（必须是 mmap 返回的地址）。
+        //length：映射的大小（应该和 mmap 时的大小一致）。
+        //成功返回0
         if (munmap(m_ptr, oldSize) != 0) {
             MMKVError("fail to munmap [%s], %s", m_diskFile.m_path.c_str(), strerror(errno));
         }
@@ -204,8 +215,16 @@ bool MemoryFile::msync(SyncFlag syncFlag) {
 }
 
 bool MemoryFile::mmap() {
+    //将当前的m_ptr值保存到oldPtr，可能是上一次映射的地址或者是初始值
     auto oldPtr = m_ptr;
+    //设置映射权限模式，MMKV_SINGLE_PROCESS MMKV_MULTI_PROCESS 都等于0 返回false 可读写
     auto mode = m_readOnly ? PROT_READ : (PROT_READ | PROT_WRITE);
+    //调用mmap创建映射
+    //m_ptr表示想要映射到的地址，可以传入nullptr让系统传入合适地址 
+    // m_size表示映射的字节数 
+    // MAP_SHARED表示映射区域对所有映射该文件的进程共享，写入修改会同步回文件 
+    // m_diskFile.m_fd表示映射的文件 
+    // offset表示映射文件偏移量
     m_ptr = (char *) ::mmap(m_ptr, m_size, mode, MAP_SHARED, m_diskFile.m_fd, 0);
     if (m_ptr == MAP_FAILED) {
         MMKVError("fail to mmap [%s], mode %x, %s", m_diskFile.m_path.c_str(), mode, strerror(errno));
@@ -217,11 +236,16 @@ bool MemoryFile::mmap() {
 }
 
 void MemoryFile::reloadFromFile(size_t expectedCapacity) {
+    //如果是android平台，且m_fileType为ashmen 那就不需要reload了
+    //根据前面的代码提示，目前应该都不是MMFILE_TYPE_ASHMEM
+    //那么什么时候用MMKVMode.MMKV_ASHMEM呢？
 #    ifdef MMKV_ANDROID
     if (m_fileType == MMFILE_TYPE_ASHMEM) {
         return;
     }
+    //结束条件编译的范围
 #    endif
+    //如果文件有效清除缓存
     if (isFileValid()) {
         MMKVWarning("calling reloadFromFile while the cache [%s] is still valid", m_diskFile.m_path.c_str());
         MMKV_ASSERT(0);
@@ -236,6 +260,10 @@ void MemoryFile::reloadFromFile(size_t expectedCapacity) {
         SCOPED_LOCK(&lock);
 
         mmkv::getFileSize(m_diskFile.m_fd, m_size);
+        // 将文件大小对齐到页大小的整数倍，用 0 填充不足的部分
+        //roundUp<size_t>(expectedCapacity, DEFAULT_MMAP_SIZE) 把 expectedCapacity 按 DEFAULT_MMAP_SIZE 进行对齐,
+        //确保 expectedCapacity 是 DEFAULT_MMAP_SIZE 的整数倍，以优化内存映射。
+        //std::max<size_t>(A, B)：返回 A 和 B 之间的较大值，保证 expectedSize 至少是 DEFAULT_MMAP_SIZE
         size_t expectedSize = std::max<size_t>(DEFAULT_MMAP_SIZE, roundUp<size_t>(expectedCapacity, DEFAULT_MMAP_SIZE));
         // round up to (n * pagesize)
         if (!m_readOnly && (m_size < expectedSize || (m_size % DEFAULT_MMAP_SIZE != 0))) {
@@ -360,17 +388,31 @@ MMBuffer *readWholeFile(const MMKVPath_t &path) {
     return buffer;
 }
 
+/**
+ * 补零
+ * @param fd 
+ * @param startPos 
+ * @param size 
+ * @return 
+ */
 bool zeroFillFile(int fd, size_t startPos, size_t size) {
     if (fd < 0) {
         return false;
     }
-
+    
+    //lseek方法修改普通文件的指针位置，参数offset为偏移量，
+    // whence为基准点：SEEK_SET：从文件开头计算偏移量
+    //               SEEK_CUR：从当前指针位置计算偏移量
+    //               SEEK_END：从文件末尾计算偏移量（一般 offset 设为负数）
+    // 成功：返回新的文件偏移量（即新的读写位置）失败：返回 -1
     if (lseek(fd, static_cast<off_t>(startPos), SEEK_SET) < 0) {
         MMKVError("fail to lseek fd[%d], error:%s", fd, strerror(errno));
         return false;
     }
-
+    //创建一个4096字节（4KB）的全0缓冲区，用于写入文件
+    //静态的，每次方法调用不会重复创建
     static const char zeros[4096] = {};
+    //按 4KB 写入，直到 size 小于 4KB
     while (size >= sizeof(zeros)) {
         if (write(fd, zeros, sizeof(zeros)) < 0) {
             MMKVError("fail to write fd[%d], error:%s", fd, strerror(errno));
@@ -378,6 +420,7 @@ bool zeroFillFile(int fd, size_t startPos, size_t size) {
         }
         size -= sizeof(zeros);
     }
+    //处理不足4KB的部分
     if (size > 0) {
         if (write(fd, zeros, size) < 0) {
             MMKVError("fail to write fd[%d], error:%s", fd, strerror(errno));
